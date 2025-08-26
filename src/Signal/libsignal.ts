@@ -1,7 +1,7 @@
 /* @ts-ignore */
 import * as libsignal from 'libsignal'
 /* @ts-ignore */
-import LRUCache from 'lru-cache';
+import { LRUCache } from 'lru-cache'
 import type { SignalAuthState, SignalKeyStoreWithTransaction } from '../Types'
 import type { SignalRepository } from '../Types/Signal'
 import { generateSignalPubKey } from '../Utils'
