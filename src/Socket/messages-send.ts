@@ -11,6 +11,7 @@ import type {
 	SocketConfig,
 	WAMessageKey
 } from '../Types'
+import { WAMessageAddressingMode } from '../Types'
 import {
 	aggregateMessageKeysNotFromMe,
 	assertMediaContent,
@@ -26,6 +27,7 @@ import {
 	getStatusCodeForMediaRetry,
 	getUrlFromDirectPath,
 	getWAUploadToServer,
+	MessageRetryManager,
 	normalizeMessageContent,
 	parseAndInjectE2ESessions,
 	unixTimestampSeconds
@@ -39,16 +41,15 @@ import {
 	getBinaryNodeChild,
 	getBinaryNodeChildren,
 	isJidGroup,
-	isJidUser,
+	isPnUser,
 	jidDecode,
 	jidEncode,
 	jidNormalizedUser,
 	type JidWithDevice,
-	S_WHATSAPP_NET
+	S_WHATSAPP_NET,
+	transferDevice
 } from '../WABinary'
 import { USyncQuery, USyncUser } from '../WAUSync'
-import { makeGroupsSocket } from './groups'
-import type { NewsletterSocket } from './newsletter'
 import { makeNewsletterSocket } from './newsletter'
 
 export const makeMessagesSocket = (config: SocketConfig) => {
@@ -58,9 +59,11 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		generateHighQualityLinkPreview,
 		options: axiosOptions,
 		patchMessageBeforeSending,
-		cachedGroupMetadata
+		cachedGroupMetadata,
+		enableRecentMessageCache,
+		maxMsgRetryCount
 	} = config
-	const sock: NewsletterSocket = makeNewsletterSocket(makeGroupsSocket(config))
+	const sock = makeNewsletterSocket(config)
 	const {
 		ev,
 		authState,
@@ -80,6 +83,9 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			stdTTL: DEFAULT_CACHE_TTLS.USER_DEVICES, // 5 minutes
 			useClones: false
 		})
+
+	// Initialize message retry manager if enabled
+	const messageRetryManager = enableRecentMessageCache ? new MessageRetryManager(logger, maxMsgRetryCount) : null
 
 	// Prevent race conditions in Signal session encryption by user
 	const encryptionMutex = makeKeyedMutex()
@@ -141,7 +147,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			node.attrs.t = unixTimestampSeconds().toString()
 		}
 
-		if (type === 'sender' && isJidUser(jid)) {
+		if (type === 'sender' && isPnUser(jid)) {
 			node.attrs.recipient = jid
 			node.attrs.to = participant!
 		} else {
@@ -439,11 +445,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				if (!jid.includes('@s.whatsapp.net')) return
 
 				try {
-					const jidDecoded = jidDecode(jid)
-					const deviceId = jidDecoded?.device || 0
-					const lidDecoded = jidDecode(lidForPN)
-					const lidWithDevice = jidEncode(lidDecoded?.user!, 'lid', deviceId)
-
+					const lidWithDevice = transferDevice(jid, lidForPN)
 					await signalRepository.migrateSession(jid, lidWithDevice)
 					logger.debug({ fromJid: jid, toJid: lidWithDevice }, 'Migrated device session to LID')
 
@@ -898,7 +900,8 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					}
 
 					if (!isStatus) {
-						const groupAddressingMode = groupData?.addressingMode || (isLid ? 'lid' : 'pn')
+						const groupAddressingMode =
+							groupData?.addressingMode || (isLid ? WAMessageAddressingMode.LID : WAMessageAddressingMode.PN)
 						additionalAttributes = {
 							...additionalAttributes,
 							addressing_mode: groupAddressingMode
@@ -1118,7 +1121,12 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			logger.debug({ msgId }, `sending message to ${participants.length} devices`)
 
 			await sendNode(stanza)
-		})
+
+			// Add message to retry cache if enabled
+			if (messageRetryManager && !participant) {
+				messageRetryManager.addRecentMessage(destinationJid, msgId, message)
+			}
+		}, meId)
 
 		return msgId
 	}
@@ -1126,6 +1134,10 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 	const getMessageType = (message: proto.IMessage) => {
 		if (message.pollCreationMessage || message.pollCreationMessageV2 || message.pollCreationMessageV3) {
 			return 'poll'
+		}
+
+		if (message.eventMessage) {
+			return 'event'
 		}
 
 		return 'text'
@@ -1211,6 +1223,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		sendPeerDataOperationMessage,
 		createParticipantNodes,
 		getUSyncDevices,
+		messageRetryManager,
 		updateMediaMessage: async (message: proto.IWebMessageInfo) => {
 			const content = assertMediaContent(message.message)
 			const mediaKey = content.mediaKey!
@@ -1229,15 +1242,15 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 							try {
 								const media = await decryptMediaRetryData(result.media!, mediaKey, result.key.id!)
 								if (media.result !== proto.MediaRetryNotification.ResultType.SUCCESS) {
-									const resultStr = proto.MediaRetryNotification.ResultType[media.result!]
+									const resultStr = proto.MediaRetryNotification.ResultType[media.result]
 									throw new Boom(`Media re-upload failed by device (${resultStr})`, {
 										data: media,
-										statusCode: getStatusCodeForMediaRetry(media.result!) || 404
+										statusCode: getStatusCodeForMediaRetry(media.result) || 404
 									})
 								}
 
 								content.directPath = media.directPath
-								content.url = getUrlFromDirectPath(content.directPath!)
+								content.url = getUrlFromDirectPath(content.directPath)
 
 								logger.debug({ directPath: media.directPath, key: result.key }, 'media update successful')
 							} catch (err: any) {
@@ -1290,12 +1303,14 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 						}),
 					//TODO: CACHE
 					getProfilePicUrl: sock.profilePictureUrl,
+					getCallLink: sock.createCallLink,
 					upload: waUploadToServer,
 					mediaCache: config.mediaCache,
 					options: config.options,
 					messageId: generateMessageIDV2(sock.user?.id),
 					...options
 				})
+				const isEventMsg = 'event' in content && !!content.event
 				const isDeleteMsg = 'delete' in content && !!content.delete
 				const isEditMsg = 'edit' in content && !!content.edit
 				const isPinMsg = 'pin' in content && !!content.pin
@@ -1319,6 +1334,13 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 						tag: 'meta',
 						attrs: {
 							polltype: 'creation'
+						}
+					} as BinaryNode)
+				} else if (isEventMsg) {
+					additionalNodes.push({
+						tag: 'meta',
+						attrs: {
+							event_type: 'creation'
 						}
 					} as BinaryNode)
 				}
