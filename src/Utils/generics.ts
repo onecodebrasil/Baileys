@@ -14,6 +14,7 @@ import type {
 } from '../Types'
 import { DisconnectReason } from '../Types'
 import { type BinaryNode, getAllBinaryNodeChildren, jidDecode } from '../WABinary'
+import { sha256 } from './crypto'
 
 const PLATFORM_MAP = {
 	aix: 'AIX',
@@ -86,6 +87,13 @@ export const unpadRandomMax16 = (e: Uint8Array | Buffer) => {
 	}
 
 	return new Uint8Array(t.buffer, t.byteOffset, t.length - r)
+}
+
+// code is inspired by whatsmeow
+export const generateParticipantHashV2 = (participants: string[]): string => {
+	participants.sort()
+	const sha256Hash = sha256(Buffer.from(participants.join(''))).toString('base64')
+	return '2:' + sha256Hash.slice(0, 6)
 }
 
 export const encodeWAMessage = (message: proto.IMessage) => writeRandomPadMax16(proto.Message.encode(message).finish())
@@ -245,15 +253,27 @@ export const bindWaitForConnectionUpdate = (ev: BaileysEventEmitter) => bindWait
  * Use to ensure your WA connection is always on the latest version
  */
 export const fetchLatestBaileysVersion = async (options: AxiosRequestConfig<{}> = {}) => {
-	const URL = 'https://raw.githubusercontent.com/WhiskeySockets/Baileys/master/src/Defaults/baileys-version.json'
+	const URL = 'https://raw.githubusercontent.com/WhiskeySockets/Baileys/master/src/Defaults/index.ts'
 	try {
-		const result = await axios.get<{ version: WAVersion }>(URL, {
+		const result = await axios.get<string>(URL, {
 			...options,
-			responseType: 'json'
+			responseType: 'text'
 		})
-		return {
-			version: result.data.version,
-			isLatest: true
+
+		// Extract version from line 7 (const version = [...])
+		const lines = result.data.split('\n')
+		const versionLine = lines[6] // Line 7 (0-indexed)
+		const versionMatch = versionLine!.match(/const version = \[(\d+),\s*(\d+),\s*(\d+)\]/)
+
+		if (versionMatch) {
+			const version = [parseInt(versionMatch[1]!), parseInt(versionMatch[2]!), parseInt(versionMatch[3]!)] as WAVersion
+
+			return {
+				version,
+				isLatest: true
+			}
+		} else {
+			throw new Error('Could not parse version from Defaults/index.ts')
 		}
 	} catch (error) {
 		return {
